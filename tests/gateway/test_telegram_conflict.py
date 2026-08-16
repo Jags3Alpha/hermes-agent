@@ -569,6 +569,21 @@ def _build_polling_app(monkeypatch, adapter):
 
 
 @pytest.mark.asyncio
+async def test_cold_start_preserves_pending_updates(monkeypatch):
+    """A cold process start must not discard messages queued while Hermes was
+    offline. Cloud restarts are routine, so treating the first connect as a
+    cleanup boundary loses legitimate user work."""
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    captured = _build_polling_app(monkeypatch, adapter)
+
+    ok = await adapter.connect()
+
+    assert ok is True
+    assert captured["drop_pending_updates"] is False
+    await _cancel_heartbeat(adapter)
+
+
+@pytest.mark.asyncio
 async def test_reconnect_preserves_pending_updates(monkeypatch):
     """A watcher reconnect (is_reconnect=True) preserves the queue Telegram
     accumulated during the outage — the core of #46621."""
