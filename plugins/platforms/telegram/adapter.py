@@ -3687,13 +3687,12 @@ class TelegramAdapter(BasePlatformAdapter):
         instead.  Webhook mode is useful for cloud deployments (Fly.io,
         Railway) where inbound HTTP can wake a suspended machine.
 
-        ``is_reconnect`` distinguishes a cold first boot (False — drop any
-        stale Bot API queue) from a watcher reconnect after a prolonged
-        outage (True — preserve the updates Telegram queued while the bot
-        was offline, otherwise every message sent during the outage is
-        silently lost). The in-process network-error ladder and the
-        409-conflict handler already pass ``drop_pending_updates=False``
-        for the same reason; bootstrap follows suit on the reconnect path.
+        ``is_reconnect`` distinguishes a cold first boot from a watcher
+        reconnect after a prolonged outage for startup readiness checks.
+        Both paths preserve the updates Telegram queued while Hermes was
+        offline; process restarts must not silently discard user messages.
+        The dedicated 409-conflict recovery path may still discard updates
+        while terminating a competing ``getUpdates`` session.
 
         Env vars for webhook mode::
 
@@ -4111,11 +4110,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     webhook_url=webhook_url,
                     secret_token=webhook_secret,
                     allowed_updates=Update.ALL_TYPES,
-                    # Webhooks are push-based — Telegram does not hold a
-                    # server-side getUpdates queue, so this flag is a no-op
-                    # in practice. Mirror the polling path's reconnect
-                    # semantics for consistency.
-                    drop_pending_updates=not is_reconnect,
+                    # Preserve queued updates across cloud process restarts.
+                    # Webhooks are push-based, so this is normally a no-op.
+                    drop_pending_updates=False,
                 )
                 self._webhook_mode = True
                 self._polling_progress_accepting = False
@@ -4169,10 +4166,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._polling_error_callback_ref = _polling_error_callback
 
                 polling_started = await self._start_polling_resilient(
-                    # On a cold first boot drop the stale Bot API queue; on a
-                    # watcher reconnect after an outage preserve it so messages
-                    # sent while the bot was offline are delivered (#46621).
-                    drop_pending_updates=not is_reconnect,
+                    # Preserve the Bot API queue on both cold starts and watcher
+                    # reconnects so cloud restarts cannot lose user messages.
+                    drop_pending_updates=False,
                     error_callback=_polling_error_callback,
                     require_progress=not is_reconnect,
                 )
