@@ -35,6 +35,7 @@ function runtime() {
     host: {
       request: async () => ({}),
       requestProfile: async () => ({}),
+      profileRoutes: async () => [],
       state: {
         profile: { get: () => 'default', listen: () => undefined },
         connectionId: { get: () => 'local', listen: () => undefined },
@@ -51,11 +52,29 @@ function runtime() {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__x = { botConnectionRoute, scopedBotParams, botBackendProfileScope, requestForBot, groupMemberKey, parseGroupChatMentions, resolveGroupResponders, formatGroupChatLine, buildGroupChatTurnPrompt };\n'
+      '\nglobalThis.__x = { activeBotRoute, botConnectionRoute, scopedBotParams, botBackendProfileScope, requestForBot, groupMemberKey, parseGroupChatMentions, resolveGroupResponders, formatGroupChatLine, buildGroupChatTurnPrompt };\n'
     )
   vm.runInNewContext(code, context, { filename: 'plugin.js' })
   return context
 }
+
+test('activeBotRoute: retains the foreground remote source while local profiles use the ambient gateway', async () => {
+  const ctx = runtime()
+  const { activeBotRoute } = ctx.__x
+
+  ctx.host.state.connectionId.get = () => 'remote-a'
+  ctx.host.state.profile.get = () => 'mia'
+  ctx.host.profileRoutes = async () => [
+    { connectionId: 'remote-a', mode: 'remote', profile: 'mia', targetProfile: 'default' }
+  ]
+
+  const remote = await activeBotRoute()
+  assert.equal(remote.connectionId, 'remote-a')
+  assert.equal(remote.profile, 'mia')
+
+  ctx.host.state.connectionId.get = () => 'local'
+  assert.equal(await activeBotRoute(), null)
+})
 
 test('botConnectionRoute: every source-scoped row gets an immutable route', () => {
   const ctx = runtime()

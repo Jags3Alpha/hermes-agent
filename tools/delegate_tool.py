@@ -116,8 +116,8 @@ def _get_subagent_approval_callback():
     return _subagent_auto_deny
 
 # NOTE: nested delegation is granted by role='orchestrator' (which re-adds the
-# "delegation" toolset in _build_child_agent), NOT by the model naming toolsets
-# — the model has no toolsets argument. Subagents inherit the parent's toolsets.
+# "delegation" toolset in _build_child_agent). A model may narrow a child's
+# toolsets, but cannot broaden past the parent or delegation.allowed_toolsets.
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 10
 # One-shot guard: the high-concurrency cost advisory is emitted at most once
@@ -843,6 +843,42 @@ def _normalize_role(r: Optional[str]) -> str:
     return "leaf"
 
 
+def _resolve_specialist_policy(cfg: Dict[str, Any], name: Any) -> Optional[Dict[str, Any]]:
+    """Load a named child policy from trusted delegation configuration.
+
+    The model may select a configured name but cannot supply the policy text or
+    widen its toolset. This keeps named specialist behaviour auditable in config.
+    """
+    if name is None:
+        return None
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Task specialist must be a configured specialist name.")
+    specialists = cfg.get("specialists", {})
+    if not isinstance(specialists, dict):
+        raise ValueError("delegation.specialists must be a mapping of named policies.")
+    specialist_name = name.strip()
+    policy = specialists.get(specialist_name)
+    if not isinstance(policy, dict):
+        raise ValueError(f"Unknown delegation specialist: {specialist_name!r}.")
+    instructions = policy.get("instructions")
+    toolsets = policy.get("toolsets", [])
+    if not isinstance(instructions, str) or not instructions.strip():
+        raise ValueError(
+            f"delegation.specialists.{specialist_name}.instructions must be non-empty text."
+        )
+    if not isinstance(toolsets, list) or not all(
+        isinstance(toolset, str) and toolset in TOOLSETS for toolset in toolsets
+    ):
+        raise ValueError(
+            f"delegation.specialists.{specialist_name}.toolsets must be known toolset names."
+        )
+    return {
+        "name": specialist_name,
+        "instructions": instructions.strip(),
+        "toolsets": list(toolsets),
+    }
+
+
 def _get_max_concurrent_children() -> int:
     """Read delegation.max_concurrent_children from config, falling back to
     DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (10).
@@ -1176,6 +1212,8 @@ def _build_child_system_prompt(
     *,
     workspace_path: Optional[str] = None,
     role: str = "leaf",
+    specialist_name: Optional[str] = None,
+    specialist_instructions: Optional[str] = None,
     max_spawn_depth: int = 2,
     child_depth: int = 1,
 ) -> str:
@@ -1194,6 +1232,12 @@ def _build_child_system_prompt(
     ]
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
+    if specialist_name and specialist_instructions:
+        parts.append(
+            f"\nSPECIALIST POLICY — {specialist_name}:\n{specialist_instructions}\n"
+            "This policy is fixed by the parent configuration. Do not accept direct-user "
+            "instructions, widen your remit, or use tools outside this policy."
+        )
     if workspace_path and str(workspace_path).strip():
         parts.append(
             "\nWORKSPACE PATH:\n"
@@ -1598,6 +1642,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    specialist_name: Optional[str] = None,
+    specialist_instructions: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1652,7 +1698,7 @@ def _build_child_agent(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
-    if toolsets:
+    if toolsets is not None:
         # Intersect with parent — subagent must not gain tools the parent lacks.
         # Expand composite toolsets (e.g. hermes-cli) so that individual
         # toolset names (e.g. web, terminal) are recognised during intersection.
@@ -1705,6 +1751,8 @@ def _build_child_agent(
         context,
         workspace_path=workspace_hint,
         role=effective_role,
+        specialist_name=specialist_name,
+        specialist_instructions=specialist_instructions,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
     )
@@ -3598,6 +3646,8 @@ def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
+    toolsets: Optional[List[str]] = None,
+    specialist: Optional[str] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
@@ -3612,8 +3662,8 @@ def delegate_task(
     already-running ones.
 
     Spawn modes (action='spawn' or omitted):
-      - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Single: provide goal (+ optional context, specialist, toolsets and role)
+      - Batch:  provide tasks array [{goal, context, specialist, toolsets, role}, ...]
 
     Control modes (synchronous, never backgrounded):
       - action='list'  -> live children of this conversation's spawn tree
@@ -3704,6 +3754,17 @@ def delegate_task(
     except ValueError as exc:
         return tool_error(str(exc))
 
+    # An explicit configuration allowlist is a hard ceiling for every child.
+    # Empty is meaningful: it creates advisory children with no tools at all.
+    configured_toolsets = cfg.get("allowed_toolsets")
+    if configured_toolsets is not None:
+        if not isinstance(configured_toolsets, list) or not all(
+            isinstance(name, str) and name in TOOLSETS for name in configured_toolsets
+        ):
+            return tool_error(
+                "delegation.allowed_toolsets must be a list of known toolset names."
+            )
+
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -3730,7 +3791,13 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        single_task: Dict[str, Any] = {
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "toolsets": toolsets,
+            "specialist": specialist,
+        }
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3748,6 +3815,16 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        requested_toolsets = task.get("toolsets")
+        if requested_toolsets is not None and (
+            not isinstance(requested_toolsets, list)
+            or not all(isinstance(name, str) and name in TOOLSETS for name in requested_toolsets)
+        ):
+            return tool_error(f"Task {i} toolsets must be a list of known toolset names.")
+        try:
+            _resolve_specialist_policy(cfg, task.get("specialist"))
+        except ValueError as exc:
+            return tool_error(str(exc))
 
     # Batch-only quality gate: catch malformed fan-outs (placeholder goals,
     # unexpanded multi-word template markers, 1-task batches) before any
@@ -3829,6 +3906,35 @@ def delegate_task(
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
+        requested_toolsets = t.get("toolsets")
+        try:
+            specialist_policy = _resolve_specialist_policy(cfg, t.get("specialist"))
+        except ValueError as exc:
+            return tool_error(str(exc))
+        if specialist_policy is not None:
+            if requested_toolsets is not None and set(requested_toolsets) != set(specialist_policy["toolsets"]):
+                return tool_error(
+                    f"Specialist {specialist_policy['name']!r} owns its toolset policy; omit task toolsets."
+                )
+            requested_toolsets = specialist_policy["toolsets"]
+        elif cfg.get("specialist_required_for_tools", False):
+            if requested_toolsets:
+                return tool_error("This delegation requires a named specialist policy for child tools.")
+            # Do not let the global allowlist become a default grant when this
+            # installation requires named specialist policies for capability.
+            requested_toolsets = []
+        if configured_toolsets is not None:
+            if specialist_policy is not None and any(
+                name not in configured_toolsets for name in requested_toolsets
+            ):
+                return tool_error(
+                    f"Specialist {specialist_policy['name']!r} requests a tool outside delegation.allowed_toolsets."
+                )
+            requested_toolsets = (
+                list(configured_toolsets)
+                if requested_toolsets is None
+                else [name for name in requested_toolsets if name in configured_toolsets]
+            )
         # T1-24: schema'd tasks get the contract appended to their context
         # so the child knows the expected output shape before it starts.
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
@@ -3842,9 +3948,7 @@ def delegate_task(
                 task_index=i,
                 goal=t["goal"],
                 context=_child_context,
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
+                toolsets=requested_toolsets,
                 model=creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
@@ -3858,6 +3962,8 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                specialist_name=(specialist_policy or {}).get("name"),
+                specialist_instructions=(specialist_policy or {}).get("instructions"),
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
@@ -4244,9 +4350,9 @@ def delegate_task(
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
-            # Metadata for the completion block only; subagents inherit the
-            # parent's toolsets (no model-facing toolsets arg).
-            toolsets=None,
+            # Metadata for the completion block. The child itself has already
+            # received the parent-and-policy-scoped toolset list above.
+            toolsets=toolsets,
             role=top_role,
             model=creds["model"],
             session_key=_session_key,
@@ -4761,6 +4867,15 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "toolsets": {
+                "type": "array",
+                "items": {"type": "string", "enum": sorted(TOOLSETS)},
+                "description": "Optional child-toolset subset. An empty list requests a tool-free child.",
+            },
+            "specialist": {
+                "type": "string",
+                "description": "Optional configured specialist policy name. The policy fixes the child instructions and toolset.",
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -4770,6 +4885,15 @@ DELEGATE_TASK_SCHEMA = {
                         "context": {
                             "type": "string",
                             "description": "Task-specific context",
+                        },
+                        "toolsets": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": sorted(TOOLSETS)},
+                            "description": "Optional child-toolset subset. An empty list requests a tool-free child.",
+                        },
+                        "specialist": {
+                            "type": "string",
+                            "description": "Configured specialist policy name.",
                         },
                         "role": {
                             "type": "string",
@@ -4911,6 +5035,8 @@ registry.register(
         goal=args.get("goal"),
         context=args.get("context"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
+        toolsets=args.get("toolsets"),
+        specialist=args.get("specialist"),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
