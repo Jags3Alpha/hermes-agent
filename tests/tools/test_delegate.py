@@ -210,6 +210,64 @@ class TestStripBlockedTools(unittest.TestCase):
         self.assertTrue(names & {"terminal", "read_file", "web_search"})
         self.assertTrue(DELEGATE_BLOCKED_TOOLS.isdisjoint(names))
 
+    def test_explicit_empty_toolsets_stays_tool_free(self):
+        """A caller can create an advisory child without inheriting parent tools."""
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "web", "delegation"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Reason from supplied context only",
+                context=None,
+                toolsets=[],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="leaf",
+            )
+
+        self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], [])
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._build_child_preserving_parent_tools")
+    @patch("tools.delegate_tool._load_config")
+    def test_delegation_allowlist_enforces_tool_free_baseline(
+        self, mock_cfg, mock_child, mock_creds
+    ):
+        """A configured empty allowlist blocks model-requested child tools."""
+        parent = _make_mock_parent()
+        mock_cfg.return_value = {
+            "allowed_toolsets": [],
+            "max_iterations": 1,
+            "max_concurrent_children": 1,
+        }
+        mock_creds.return_value = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        child = MagicMock()
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 1,
+        }
+        mock_child.return_value = child
+
+        delegate_task(
+            goal="Reason from supplied context only",
+            toolsets=["terminal"],
+            parent_agent=parent,
+        )
+
+        assert mock_child.call_args.kwargs["toolsets"] == []
+
     def test_orchestrator_composite_regains_only_delegate_task(self):
         import model_tools
 

@@ -116,8 +116,8 @@ def _get_subagent_approval_callback():
     return _subagent_auto_deny
 
 # NOTE: nested delegation is granted by role='orchestrator' (which re-adds the
-# "delegation" toolset in _build_child_agent), NOT by the model naming toolsets
-# — the model has no toolsets argument. Subagents inherit the parent's toolsets.
+# "delegation" toolset in _build_child_agent). A model may narrow a child's
+# toolsets, but cannot broaden past the parent or delegation.allowed_toolsets.
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 10
 # One-shot guard: the high-concurrency cost advisory is emitted at most once
@@ -1652,7 +1652,7 @@ def _build_child_agent(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
-    if toolsets:
+    if toolsets is not None:
         # Intersect with parent — subagent must not gain tools the parent lacks.
         # Expand composite toolsets (e.g. hermes-cli) so that individual
         # toolset names (e.g. web, terminal) are recognised during intersection.
@@ -3598,6 +3598,7 @@ def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
+    toolsets: Optional[List[str]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
@@ -3612,8 +3613,8 @@ def delegate_task(
     already-running ones.
 
     Spawn modes (action='spawn' or omitted):
-      - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Single: provide goal (+ optional context, toolsets and role)
+      - Batch:  provide tasks array [{goal, context, toolsets, role}, ...]
 
     Control modes (synchronous, never backgrounded):
       - action='list'  -> live children of this conversation's spawn tree
@@ -3704,6 +3705,17 @@ def delegate_task(
     except ValueError as exc:
         return tool_error(str(exc))
 
+    # An explicit configuration allowlist is a hard ceiling for every child.
+    # Empty is meaningful: it creates advisory children with no tools at all.
+    configured_toolsets = cfg.get("allowed_toolsets")
+    if configured_toolsets is not None:
+        if not isinstance(configured_toolsets, list) or not all(
+            isinstance(name, str) and name in TOOLSETS for name in configured_toolsets
+        ):
+            return tool_error(
+                "delegation.allowed_toolsets must be a list of known toolset names."
+            )
+
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -3730,7 +3742,12 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        single_task: Dict[str, Any] = {
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "toolsets": toolsets,
+        }
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3748,6 +3765,12 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        requested_toolsets = task.get("toolsets")
+        if requested_toolsets is not None and (
+            not isinstance(requested_toolsets, list)
+            or not all(isinstance(name, str) and name in TOOLSETS for name in requested_toolsets)
+        ):
+            return tool_error(f"Task {i} toolsets must be a list of known toolset names.")
 
     # Batch-only quality gate: catch malformed fan-outs (placeholder goals,
     # unexpanded multi-word template markers, 1-task batches) before any
@@ -3829,6 +3852,13 @@ def delegate_task(
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
+        requested_toolsets = t.get("toolsets")
+        if configured_toolsets is not None:
+            requested_toolsets = (
+                list(configured_toolsets)
+                if requested_toolsets is None
+                else [name for name in requested_toolsets if name in configured_toolsets]
+            )
         # T1-24: schema'd tasks get the contract appended to their context
         # so the child knows the expected output shape before it starts.
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
@@ -3842,9 +3872,7 @@ def delegate_task(
                 task_index=i,
                 goal=t["goal"],
                 context=_child_context,
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
+                toolsets=requested_toolsets,
                 model=creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
@@ -4244,9 +4272,9 @@ def delegate_task(
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
-            # Metadata for the completion block only; subagents inherit the
-            # parent's toolsets (no model-facing toolsets arg).
-            toolsets=None,
+            # Metadata for the completion block. The child itself has already
+            # received the parent-and-policy-scoped toolset list above.
+            toolsets=toolsets,
             role=top_role,
             model=creds["model"],
             session_key=_session_key,
@@ -4761,6 +4789,11 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "toolsets": {
+                "type": "array",
+                "items": {"type": "string", "enum": sorted(TOOLSETS)},
+                "description": "Optional child-toolset subset. An empty list requests a tool-free child.",
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -4770,6 +4803,11 @@ DELEGATE_TASK_SCHEMA = {
                         "context": {
                             "type": "string",
                             "description": "Task-specific context",
+                        },
+                        "toolsets": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": sorted(TOOLSETS)},
+                            "description": "Optional child-toolset subset. An empty list requests a tool-free child.",
                         },
                         "role": {
                             "type": "string",
@@ -4911,6 +4949,7 @@ registry.register(
         goal=args.get("goal"),
         context=args.get("context"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
+        toolsets=args.get("toolsets"),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
