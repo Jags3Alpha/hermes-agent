@@ -4375,6 +4375,28 @@ function persistBotMetaSnapshot(value, scoped = false) {
 // active-gateway door. Feature-detected: older desktops without
 // requestProfile simply have no remote routes (callers fall back / disable).
 
+/** Resolve the connection-qualified owner of the foreground profile.
+ *
+ * The roster itself is read from the active gateway, so a local foreground
+ * profile deliberately keeps the ordinary `host.request` path. A registered
+ * remote gateway needs its immutable route descriptor, otherwise a poll can
+ * follow a foreground switch and read the wrong source. */
+async function activeBotRoute() {
+  const connectionId = String(host.state.connectionId?.get?.() || host.activeConnectionId?.() || '').trim()
+
+  if (!connectionId || connectionId === 'local' || typeof host.profileRoutes !== 'function') {
+    return null
+  }
+
+  const profile = String(host.state.profile?.get?.() || 'default').trim() || 'default'
+  const routes = await host.profileRoutes()
+
+  return (Array.isArray(routes) ? routes : []).find(candidate =>
+    String(candidate?.connectionId || '') === connectionId &&
+    (String(candidate?.profile || '') === profile || String(candidate?.targetProfile || '') === profile)
+  ) || null
+}
+
 /** Immutable owner descriptor for every source-scoped row. The active
  *  gateway is presentation state and is never consulted here. */
 function botConnectionRoute(bot) {
