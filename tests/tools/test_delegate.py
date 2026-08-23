@@ -30,6 +30,7 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _resolve_specialist_policy,
 )
 from hermes_state import SessionDB
 
@@ -65,11 +66,13 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
-        # toolsets is intentionally NOT exposed to the model — subagents always
-        # inherit the parent's toolsets. Letting the model name toolsets was a
-        # capability-selection surface the model should not control.
-        self.assertNotIn("toolsets", props)
-        self.assertNotIn("toolsets", props["tasks"]["items"]["properties"])
+        # A model can narrow a child to a configured subset, including an
+        # explicit empty list. It cannot broaden beyond the parent's enabled
+        # tools or delegation.allowed_toolsets.
+        self.assertIn("toolsets", props)
+        self.assertIn("toolsets", props["tasks"]["items"]["properties"])
+        self.assertIn("specialist", props)
+        self.assertIn("specialist", props["tasks"]["items"]["properties"])
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
@@ -138,6 +141,36 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("Fix the tests", prompt)
         self.assertIn("YOUR TASK", prompt)
         self.assertNotIn("CONTEXT", prompt)
+
+    def test_specialist_policy_is_injected_into_child_prompt(self):
+        prompt = _build_child_system_prompt(
+            "Summarise the supplied sources",
+            specialist_name="research-desk",
+            specialist_instructions="Use supplied evidence only. Return uncertainty.",
+        )
+        self.assertIn("SPECIALIST POLICY — research-desk", prompt)
+        self.assertIn("Use supplied evidence only.", prompt)
+
+
+class TestSpecialistPolicies(unittest.TestCase):
+    def test_rejects_unknown_specialist(self):
+        with self.assertRaisesRegex(ValueError, "Unknown delegation specialist"):
+            _resolve_specialist_policy({"specialists": {}}, "research-desk")
+
+    def test_loads_only_configured_instructions_and_toolsets(self):
+        policy = _resolve_specialist_policy(
+            {
+                "specialists": {
+                    "research-desk": {
+                        "instructions": "Use primary sources and return uncertainty.",
+                        "toolsets": ["web"],
+                    }
+                }
+            },
+            "research-desk",
+        )
+        self.assertEqual(policy["toolsets"], ["web"])
+        self.assertIn("primary sources", policy["instructions"])
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
@@ -267,6 +300,46 @@ class TestStripBlockedTools(unittest.TestCase):
         )
 
         assert mock_child.call_args.kwargs["toolsets"] == []
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._build_child_preserving_parent_tools")
+    @patch("tools.delegate_tool._load_config")
+    def test_named_policy_is_required_for_global_tool_allowlist(
+        self, mock_cfg, mock_child, mock_creds
+    ):
+        """A global ceiling is not an implicit tool grant under named-policy mode."""
+        parent = _make_mock_parent()
+        mock_cfg.return_value = {
+            "allowed_toolsets": ["web"],
+            "specialist_required_for_tools": True,
+            "specialists": {
+                "research-desk": {
+                    "instructions": "Use primary sources and return uncertainty.",
+                    "toolsets": ["web"],
+                }
+            },
+            "max_iterations": 1,
+            "max_concurrent_children": 1,
+        }
+        mock_creds.return_value = {
+            "model": None, "provider": None, "base_url": None,
+            "api_key": None, "api_mode": None,
+        }
+        child = MagicMock()
+        child.run_conversation.return_value = {
+            "final_response": "done", "completed": True,
+            "interrupted": False, "api_calls": 1,
+        }
+        mock_child.return_value = child
+
+        delegate_task(goal="Reason from supplied context only", parent_agent=parent)
+        assert mock_child.call_args.kwargs["toolsets"] == []
+
+        delegate_task(
+            goal="Research the supplied question", specialist="research-desk", parent_agent=parent
+        )
+        assert mock_child.call_args.kwargs["toolsets"] == ["web"]
+        assert mock_child.call_args.kwargs["specialist_name"] == "research-desk"
 
     def test_orchestrator_composite_regains_only_delegate_task(self):
         import model_tools

@@ -8382,6 +8382,7 @@ class AIAgent:
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             toolsets=function_args.get("toolsets"),
+            specialist=function_args.get("specialist"),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             background=(not _is_subagent),

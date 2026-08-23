@@ -1921,6 +1921,13 @@ DEFAULT_CONFIG = {
         # parent-scoped inheritance; an explicit empty list creates tool-free
         # advisory children.
         "allowed_toolsets": None,
+        # Optional named child policies. A policy supplies its own immutable
+        # instructions and approved toolset subset; the model selects only a
+        # configured name through delegate_task(specialist=...).
+        "specialists": {},
+        # When true, a child may receive tools only through a named policy.
+        # This is off by default for backwards compatibility.
+        "specialist_required_for_tools": False,
         "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch
